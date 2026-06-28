@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coarse-Graining Visualization</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: #040910; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CONSTANTS
+    // ═══════════════════════════════════════════════════════════════
+    const DOM     = 10;
+    const L       = 1.0;
+    const N_VIS   = 60;
+    const MARGIN  = 5;
+    const DOM_EXT = DOM + 2 * MARGIN;
+    const N_TOT   = Math.round(N_VIS * (DOM_EXT / DOM) ** 2);
+    const GRID    = 64;
+    const PX      = 260;
+    const P_SIGMA = 1.5;
+
+    const RHO_REF = N_VIS / (DOM * DOM);
+    const J_REF   = RHO_REF * P_SIGMA;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  MATH HELPERS
+    // ═══════════════════════════════════════════════════════════════
+    function randn() {
+      const u = 1 - Math.random(), v = Math.random();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+
+    function msExpect(m, n = 1000) {
+      let num = 0, den = 0;
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n - 0.5) * Math.PI;
+        const w = Math.exp(m * Math.cos(2 * t));
+        num += Math.cos(2 * t) * w; den += w;
+      }
+      return num / den;
+    }
+
+    function findM(S) {
+      if (S < 0.02) return 0;
+      if (S > 0.99) return 80;
+      let lo = 0, hi = 80;
+      for (let i = 0; i < 64; i++) {
+        const mid = (lo + hi) / 2;
+        msExpect(mid) < S ? (lo = mid) : (hi = mid);
+      }
+      return (lo + hi) / 2;
+    }
+
+    function buildMSICDF(m, nGrid = 800) {
+      const a = -Math.PI / 2;
+      const dt = Math.PI / nGrid;
+      const thetas = new Float64Array(nGrid + 1);
+      const cdfs   = new Float64Array(nGrid + 1);
+      let cum = 0;
+      let prevW = Math.exp(m * Math.cos(2 * a));
+      thetas[0] = a; cdfs[0] = 0;
+      for (let i = 1; i <= nGrid; i++) {
+        const t = a + i * dt;
+        const w = Math.exp(m * Math.cos(2 * t));
+        cum += 0.5 * (prevW + w) * dt;
+        thetas[i] = t;
+        cdfs[i]   = cum;
+        prevW = w;
+      }
+      const Z = cdfs[nGrid];
+      for (let i = 1; i <= nGrid; i++) cdfs[i] /= Z;
+      cdfs[nGrid] = 1;
+      return { thetas, cdfs };
+    }
+
+    function sampleFromMSICDF({ thetas, cdfs }, u) {
+      let lo = 0, hi = cdfs.length - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (cdfs[mid] < u) lo = mid; else hi = mid;
+      }
+      const denom = cdfs[hi] - cdfs[lo];
+      const s = denom > 1e-12 ? (u - cdfs[lo]) / denom : 0;
+      return thetas[lo] + s * (thetas[hi] - thetas[lo]);
+    }
+
+    function lerpAngle(a, b, t) {
+      let d = b - a;
+      while (d >  Math.PI / 2) d -= Math.PI;
+      while (d < -Math.PI / 2) d += Math.PI;
+      return a + d * t;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  MOLECULE GENERATION
+    // ═══════════════════════════════════════════════════════════════
+    function generateMolecules(S) {
+      const icdf = buildMSICDF(findM(S));
+      return Array.from({ length: N_TOT }, () => {
+        const u = Math.random();
+        return {
+          x:    -MARGIN + Math.random() * DOM_EXT,
+          y:    -MARGIN + Math.random() * DOM_EXT,
+          u,
+          theta: sampleFromMSICDF(icdf, u),
+          qx:   randn() * P_SIGMA,
+          qy:   randn() * P_SIGMA,
+          dpx:  randn() * P_SIGMA,
+          dpy:  randn() * P_SIGMA,
+        };
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  COARSE-GRAINING
+    // ═══════════════════════════════════════════════════════════════
+    function computeCG(mols, lamL, flowVx, flowVy, spinAmp) {
+      const lam   = lamL;
+      const cut2  = (4 * lam) ** 2;
+      const normW = 1 / (2 * Math.PI * lam * lam);
+      const inv2  = 1 / (2 * lam * lam);
+
+      const rho = new Float64Array(GRID * GRID);
+      const Qcx = new Float64Array(GRID * GRID);
+      const Qsy = new Float64Array(GRID * GRID);
+      const Jx  = new Float64Array(GRID * GRID);
+      const Jy  = new Float64Array(GRID * GRID);
+
+      const molData = mols.map(mol => {
+        const cosT = Math.cos(mol.theta), sinT = Math.sin(mol.theta);
+        return {
+          ax0: mol.x + 0.5 * L * cosT,  ay0: mol.y + 0.5 * L * sinT,
+          ax1: mol.x - 0.5 * L * cosT,  ay1: mol.y - 0.5 * L * sinT,
+          c2:  Math.cos(2 * mol.theta),
+          s2:  Math.sin(2 * mol.theta),
+          p0x: flowVx + mol.qx + spinAmp * mol.dpx,
+          p0y: flowVy + mol.qy + spinAmp * mol.dpy,
+          p1x: flowVx + mol.qx - spinAmp * mol.dpx,
+          p1y: flowVy + mol.qy - spinAmp * mol.dpy,
+        };
+      });
+
+      for (let gj = 0; gj < GRID; gj++) {
+        const ry = (gj + 0.5) * DOM / GRID;
+        for (let gi = 0; gi < GRID; gi++) {
+          const rx = (gi + 0.5) * DOM / GRID;
+          let d = 0, qx = 0, qy = 0, jx = 0, jy = 0;
+
+          for (const md of molData) {
+            {
+              const ddx = rx - md.ax0, ddy = ry - md.ay0;
+              const r2  = ddx * ddx + ddy * ddy;
+              if (r2 <= cut2) {
+                const w = normW * Math.exp(-r2 * inv2);
+                d  += 0.5 * w;
+                qx += md.c2 * 0.5 * w;
+                qy += md.s2 * 0.5 * w;
+                jx += md.p0x * w;
+                jy += md.p0y * w;
+              }
+            }
+            {
+              const ddx = rx - md.ax1, ddy = ry - md.ay1;
+              const r2  = ddx * ddx + ddy * ddy;
+              if (r2 <= cut2) {
+                const w = normW * Math.exp(-r2 * inv2);
+                d  += 0.5 * w;
+                qx += md.c2 * 0.5 * w;
+                qy += md.s2 * 0.5 * w;
+                jx += md.p1x * w;
+                jy += md.p1y * w;
+              }
+            }
+          }
+
+          const idx = gj * GRID + gi;
+          rho[idx] = d; Qcx[idx] = qx; Qsy[idx] = qy;
+          Jx[idx]  = jx; Jy[idx] = jy;
+        }
+      }
+
+      const phi0   = new Float32Array(GRID * GRID);
+      const localS = new Float32Array(GRID * GRID);
+      const Jmag   = new Float32Array(GRID * GRID);
+      let maxRho = 0;
+
+      for (let idx = 0; idx < GRID * GRID; idx++) {
+        phi0[idx]   = Math.atan2(Qsy[idx], Qcx[idx]) / 2;
+        localS[idx] = rho[idx] > 0
+          ? Math.sqrt(Qcx[idx] ** 2 + Qsy[idx] ** 2) / rho[idx] : 0;
+        Jmag[idx]   = Math.sqrt(Jx[idx] ** 2 + Jy[idx] ** 2);
+        if (rho[idx] > maxRho) maxRho = rho[idx];
+      }
+
+      return { rho, phi0, localS, maxRho, Jx, Jy, Jmag };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  COLORMAPS
+    // ═══════════════════════════════════════════════════════════════
+    function hsvToRgb(h, s, v) {
+      h = ((h % 360) + 360) % 360;
+      const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+      const [r, g, b] =
+        h < 60  ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] :
+        h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+      return [Math.round((r+m)*255), Math.round((g+m)*255), Math.round((b+m)*255)];
+    }
+
+    function orientColor(theta) {
+      const t = (((theta % Math.PI) + Math.PI) % Math.PI) / Math.PI;
+      return hsvToRgb(t * 360, 0.90, 1.0);
+    }
+
+    function momentumColor(angle) {
+      const h = ((angle / (2 * Math.PI)) * 360 + 360) % 360;
+      return hsvToRgb(h, 0.88, 1.0);
+    }
+
+    const PLASMA_STOPS = [
+      [0.00, [4,  11, 24]],
+      [0.17, [28, 18, 105]],
+      [0.40, [112, 38, 170]],
+      [0.63, [215, 62, 65]],
+      [0.82, [244, 146, 18]],
+      [1.00, [253, 242, 68]],
+    ];
+
+    function interpolateStops(stops, t) {
+      t = Math.max(0, Math.min(1, t));
+      let lo = stops[0], hi = stops[stops.length - 1];
+      for (let i = 0; i < stops.length - 1; i++) {
+        if (t >= stops[i][0] && t <= stops[i + 1][0]) {
+          lo = stops[i]; hi = stops[i + 1]; break;
+        }
+      }
+      const s = hi[0] === lo[0] ? 0 : (t - lo[0]) / (hi[0] - lo[0]);
+      return lo[1].map((c, k) => Math.round(c + s * (hi[1][k] - c)));
+    }
+
+    const densityColor = t => interpolateStops(PLASMA_STOPS, t);
+
+    // ═══════════════════════════════════════════════════════════════
+    //  IMAGE BUILDER
+    // ═══════════════════════════════════════════════════════════════
+    function buildImage(getter, colorFn) {
+      const img = new ImageData(PX, PX);
+      for (let py = 0; py < PX; py++) {
+        const gfy = (py + 0.5) / PX * GRID - 0.5;
+        const gj  = Math.floor(gfy), fy = gfy - gj;
+        for (let px = 0; px < PX; px++) {
+          const gfx = (px + 0.5) / PX * GRID - 0.5;
+          const gi  = Math.floor(gfx), fx = gfx - gi;
+          const cl  = v => Math.max(0, Math.min(GRID - 1, v));
+          const g   = (ii, jj) => getter(cl(ii), cl(jj));
+          const val = g(gi,  gj)   * (1-fx) * (1-fy)
+                    + g(gi+1,gj)   *    fx  * (1-fy)
+                    + g(gi,  gj+1) * (1-fx) *    fy
+                    + g(gi+1,gj+1) *    fx  *    fy;
+          const [r, g2, b] = colorFn(val);
+          const idx = (py * PX + px) * 4;
+          img.data[idx]=r; img.data[idx+1]=g2; img.data[idx+2]=b; img.data[idx+3]=255;
+        }
+      }
+      return img;
+    }
+
+    function buildDensityImage({ rho }) {
+      return buildImage(
+        (gi, gj) => rho[gj * GRID + gi],
+        v => densityColor(Math.min(0.82, v / RHO_REF)),
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  DRAW HELPER
+    // ═══════════════════════════════════════════════════════════════
+    function drawArrow(ctx, x0, y0, phi, len, headSize = 3.5) {
+      const tx = x0 + Math.cos(phi) * len;
+      const ty = y0 + Math.sin(phi) * len;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(tx, ty); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(tx, ty);
+      ctx.lineTo(tx - headSize * Math.cos(phi - 0.45), ty - headSize * Math.sin(phi - 0.45));
+      ctx.moveTo(tx, ty);
+      ctx.lineTo(tx - headSize * Math.cos(phi + 0.45), ty - headSize * Math.sin(phi + 0.45));
+      ctx.stroke();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  COMPONENT
+    // ═══════════════════════════════════════════════════════════════
+    function App() {
+      const [S,        setS]    = useState(0.70);
+      const [lamL,     setLamL] = useState(1.50);
+      const [flowV,    setFlowV]= useState(1.00);
+      const [spinAmp,  setSpinAmp] = useState(1.00);
+      const [spinning, setSpin] = useState(false);
+      const [omega,    setOmega]= useState(0.50);
+      const [spinAngle,setSA]   = useState(0);
+      const [mols,     setMols] = useState(() => generateMolecules(0.70));
+
+      const leftRef      = useRef(null);
+      const midRef       = useRef(null);
+      const rightRef     = useRef(null);
+      const animRef      = useRef(null);
+      const prevTs       = useRef(null);
+      const molsRef      = useRef(mols);
+      const tweenRafRef  = useRef(null);
+      const tweenDataRef = useRef(null);
+
+      useEffect(() => { molsRef.current = mols; }, [mols]);
+      useEffect(() => () => {
+        if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+      }, []);
+
+      const flowVx = flowV;
+      const flowVy = 0;
+
+      const cgFields   = useMemo(
+        () => computeCG(mols, lamL, flowVx, flowVy, spinAmp),
+        [mols, lamL, flowVx, flowVy, spinAmp],
+      );
+      const densityImg = useMemo(() => buildDensityImage(cgFields), [cgFields]);
+
+      const startTween = useCallback((fromThetas, toThetas) => {
+        if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+        tweenDataRef.current = { fromThetas, toThetas, startTime: performance.now(), duration: 450 };
+        const tick = ts => {
+          if (!tweenDataRef.current) return;
+          const { fromThetas: ft, toThetas: tt, startTime, duration } = tweenDataRef.current;
+          const t    = Math.min(1, (ts - startTime) / duration);
+          const ease = 1 - (1 - t) ** 3;
+          setMols(prev => prev.map((mol, i) => ({ ...mol, theta: lerpAngle(ft[i], tt[i], ease) })));
+          if (t < 1) { tweenRafRef.current = requestAnimationFrame(tick); }
+          else        { tweenDataRef.current = null; tweenRafRef.current = null; }
+        };
+        tweenRafRef.current = requestAnimationFrame(tick);
+      }, []);
+
+      const resample = useCallback(() => {
+        if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+        tweenDataRef.current = null; tweenRafRef.current = null;
+        setMols(generateMolecules(S));
+        setSA(0); prevTs.current = null;
+      }, [S]);
+
+      const handleS = useCallback(v => {
+        setS(v);
+        const icdf = buildMSICDF(findM(v));
+        const cur  = molsRef.current;
+        startTween(
+          cur.map(mol => mol.theta),
+          cur.map(mol => sampleFromMSICDF(icdf, mol.u)),
+        );
+      }, [startTween]);
+
+      useEffect(() => {
+        if (!spinning) { prevTs.current = null; return; }
+        const frame = ts => {
+          if (prevTs.current !== null)
+            setSA(a => a + omega * (ts - prevTs.current) / 1000);
+          prevTs.current = ts;
+          animRef.current = requestAnimationFrame(frame);
+        };
+        animRef.current = requestAnimationFrame(frame);
+        return () => { cancelAnimationFrame(animRef.current); prevTs.current = null; };
+      }, [spinning, omega]);
+
+      useEffect(() => {
+        const cv = leftRef.current; if (!cv) return;
+        const ctx = cv.getContext("2d");
+        ctx.fillStyle = "#060e1c"; ctx.fillRect(0, 0, PX, PX);
+
+        ctx.strokeStyle = "#0a1828"; ctx.lineWidth = 0.5;
+        for (let v = 0; v <= DOM; v += 2) {
+          const p = v / DOM * PX;
+          ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, PX); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(PX, p); ctx.stroke();
+        }
+
+        const halfPx = (L / 2 / DOM) * PX;
+        const MOM_PX = 14;
+        const cs = Math.cos(spinAngle), sn = Math.sin(spinAngle);
+        let visCount = 0;
+
+        for (const mol of mols) {
+          if (mol.x < 0 || mol.x > DOM || mol.y < 0 || mol.y > DOM) continue;
+          visCount++;
+
+          const angle = mol.theta + spinAngle;
+          const cx = mol.x / DOM * PX;
+          const cy = mol.y / DOM * PX;
+          const dx = Math.cos(angle) * halfPx;
+          const dy = Math.sin(angle) * halfPx;
+          const [r, g, b] = orientColor(angle);
+          const col = `rgb(${r},${g},${b})`;
+
+          ctx.globalAlpha = 0.72;
+          ctx.strokeStyle = col; ctx.lineWidth = 1.8;
+          ctx.beginPath(); ctx.moveTo(cx-dx, cy-dy); ctx.lineTo(cx+dx, cy+dy); ctx.stroke();
+
+          ctx.globalAlpha = 1.0;
+          ctx.fillStyle = col;
+          ctx.shadowColor = col; ctx.shadowBlur = 5;
+          for (const [ax, ay] of [[cx+dx, cy+dy], [cx-dx, cy-dy]]) {
+            ctx.beginPath(); ctx.arc(ax, ay, 3.5, 0, 2 * Math.PI); ctx.fill();
+          }
+          ctx.shadowBlur = 0;
+
+          const atomData = [
+            { ax: cx+dx, ay: cy+dy, px: flowVx + mol.qx + spinAmp * mol.dpx, py: flowVy + mol.qy + spinAmp * mol.dpy },
+            { ax: cx-dx, ay: cy-dy, px: flowVx + mol.qx - spinAmp * mol.dpx, py: flowVy + mol.qy - spinAmp * mol.dpy },
+          ];
+          ctx.lineWidth = 1.3;
+          for (const { ax, ay, px, py } of atomData) {
+            const pxr = px * cs - py * sn;
+            const pyr = px * sn + py * cs;
+            const phi = Math.atan2(pyr, pxr);
+            const len = Math.sqrt(pxr*pxr + pyr*pyr) * MOM_PX;
+            const [mr, mg, mb] = momentumColor(phi);
+            ctx.globalAlpha = 0.90;
+            ctx.strokeStyle = `rgb(${mr},${mg},${mb})`;
+            drawArrow(ctx, ax, ay, phi, len, 3);
+          }
+        }
+        ctx.globalAlpha = 1;
+
+        ctx.fillStyle = "#38bdf8";
+        ctx.font = "bold 11px 'Courier New', monospace";
+        ctx.fillText("MICROSCOPIC", 7, 17);
+        ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.font = "8.5px 'Courier New', monospace";
+        ctx.fillText(`N = ${visCount}   S = ${S.toFixed(2)}`, 7, 28);
+        ctx.fillText("bonds + atom momenta (arrows)", 7, 39);
+      }, [mols, spinAngle, S, flowVx, flowVy, spinAmp]);
+
+      useEffect(() => {
+        const cv = midRef.current; if (!cv) return;
+        const ctx = cv.getContext("2d");
+        ctx.putImageData(densityImg, 0, 0);
+
+        ctx.fillStyle = "#fb923c";
+        ctx.font = "bold 11px 'Courier New', monospace";
+        ctx.fillText("CG DENSITY", 7, 17);
+        ctx.fillStyle = "rgba(255,255,255,0.60)"; ctx.font = "8.5px 'Courier New', monospace";
+        ctx.fillText(`λ = ${lamL.toFixed(2)} L`, 7, 28);
+        ctx.fillText("ρ(r) = Σα Wλ(r − rα)", 7, 39);
+      }, [densityImg, lamL]);
+
+      useEffect(() => {
+        const cv = rightRef.current; if (!cv) return;
+        const ctx = cv.getContext("2d");
+        ctx.fillStyle = "#060e1c"; ctx.fillRect(0, 0, PX, PX);
+
+        const { Jx, Jy, Jmag } = cgFields;
+        const step       = 4;
+        const maxArrowPx = (PX / GRID) * step * 2.2;
+        const cs = Math.cos(spinAngle), sn = Math.sin(spinAngle);
+
+        for (let gj = 0; gj < GRID; gj += step) {
+          for (let gi = 0; gi < GRID; gi += step) {
+            const idx = gj * GRID + gi;
+            const jm  = Jmag[idx];
+            if (jm < J_REF * 0.05) continue;
+
+            const jxr = Jx[idx] * cs - Jy[idx] * sn;
+            const jyr = Jx[idx] * sn + Jy[idx] * cs;
+            const phi = Math.atan2(jyr, jxr);
+            const len = Math.min(maxArrowPx, (jm / J_REF) * (maxArrowPx * 0.5));
+
+            const cx = (gi + 0.5) / GRID * PX;
+            const cy = (gj + 0.5) / GRID * PX;
+            const [r, g, b] = momentumColor(phi);
+            ctx.strokeStyle = `rgba(${r},${g},${b},0.90)`;
+            ctx.lineWidth = 1.5;
+            drawArrow(ctx, cx, cy, phi, len, 4);
+          }
+        }
+
+        ctx.fillStyle = "#4ade80";
+        ctx.font = "bold 11px 'Courier New', monospace";
+        ctx.fillText("CG MOMENTUM", 7, 17);
+        ctx.fillStyle = "rgba(255,255,255,0.60)"; ctx.font = "8.5px 'Courier New', monospace";
+        ctx.fillText(`λ = ${lamL.toFixed(2)} L`, 7, 28);
+        ctx.fillText("J(r) = Σα Wλ(r − rα) pα", 7, 39);
+      }, [cgFields, spinAngle, lamL]);
+
+      return (
+        <div style={{
+          background: "#040910",
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "18px",
+          gap: "14px",
+          fontFamily: "'Courier New', monospace",
+        }}>
+
+          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <canvas ref={leftRef} width={PX} height={PX}
+              style={{ borderRadius: "8px", border: "1px solid #0d1c36", display: "block" }} />
+            <Chevron />
+            <canvas ref={midRef} width={PX} height={PX}
+              style={{ borderRadius: "8px", border: "1px solid #0d1c36", display: "block" }} />
+            <Chevron />
+            <canvas ref={rightRef} width={PX} height={PX}
+              style={{ borderRadius: "8px", border: "1px solid #0d1c36", display: "block" }} />
+          </div>
+
+          <div style={{
+            width: "100%",
+            maxWidth: 3 * PX + 80,
+            background: "rgba(5, 11, 21, 0.97)",
+            border: "1px solid #0d1c36",
+            borderRadius: "10px",
+            padding: "13px 18px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "9px",
+          }}>
+
+            <SliderRow label={`S = ${S.toFixed(2)}`}
+              hint="Maier-Saupe order  (0 = isotropic · 1 = fully aligned)" accent="#8b5cf6">
+              <input type="range" min={0} max={1} step={0.05} value={S}
+                onChange={e => handleS(+e.target.value)}
+                style={{ flex: 1, accentColor: "#8b5cf6" }} />
+            </SliderRow>
+
+            <SliderRow label={`λ = ${lamL.toFixed(1)} L`}
+              hint="CG scale  (0.2 L – 5 L)" accent="#0ea5e9">
+              <input type="range" min={0.2} max={5.0} step={0.1} value={lamL}
+                onChange={e => setLamL(+e.target.value)}
+                style={{ flex: 1, accentColor: "#0ea5e9" }} />
+            </SliderRow>
+
+            <SliderRow label={`v = ${flowV.toFixed(1)} P`}
+              hint="COM flow speed  (0 = no drift · 3 = fast)" accent="#f472b6">
+              <input type="range" min={0} max={3.0} step={0.1} value={flowV}
+                onChange={e => setFlowV(+e.target.value)}
+                style={{ flex: 1, accentColor: "#f472b6" }} />
+            </SliderRow>
+
+            <SliderRow label={`spin = ${spinAmp.toFixed(2)}`}
+              hint="Molecular spin scale  (0 = all atoms co-move · 1 = full random spin)" accent="#34d399">
+              <input type="range" min={0} max={1.0} step={0.05} value={spinAmp}
+                onChange={e => setSpinAmp(+e.target.value)}
+                style={{ flex: 1, accentColor: "#34d399" }} />
+            </SliderRow>
+
+            <div style={{ display: "flex", gap: "9px", alignItems: "center", flexWrap: "wrap" }}>
+              <PillBtn color="#22d3ee" onClick={resample}>↺ Resample</PillBtn>
+
+              <PillBtn color={spinning ? "#f43f5e" : "#fb923c"} onClick={() => setSpin(s => !s)}>
+                {spinning ? "⏹ Stop spin" : "⟳ Spin fluid"}
+              </PillBtn>
+
+              {spinning && (
+                <SliderRow label={`Ω = ${omega.toFixed(1)} rad/s`} hint="" accent="#f97316">
+                  <input type="range" min={0.1} max={3.0} step={0.1} value={omega}
+                    onChange={e => setOmega(+e.target.value)}
+                    style={{ width: 110, accentColor: "#f97316" }} />
+                </SliderRow>
+              )}
+            </div>
+
+            <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", paddingTop: "2px", alignItems: "center" }}>
+              {[
+                [0, "0°"], [Math.PI/4, "45°"], [Math.PI/2, "90°"], [-Math.PI/4, "135°"],
+              ].map(([angle, label]) => (
+                <OrientSwatch key={label} angle={angle} label={`bond ${label}`} />
+              ))}
+              <span style={{ fontSize: "10px", color: "#6b90b8" }}>
+                ρ:&nbsp;
+                <span style={{ color: "#2a1a70" }}>▇</span>
+                <span style={{ color: "#7c3aed" }}>▇</span>
+                <span style={{ color: "#fb923c" }}>▇</span>
+                <span style={{ color: "#f59e0b" }}>▇</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SUB-COMPONENTS
+    // ═══════════════════════════════════════════════════════════════
+
+    function Chevron() {
+      return (
+        <div style={{ textAlign: "center", color: "#2a4a70", lineHeight: 1.5, padding: "0 2px", minWidth: "22px" }}>
+          <div style={{ fontSize: "13px" }}>⊛</div>
+          <div style={{ fontSize: "8px" }}>Wλ</div>
+          <div style={{ fontSize: "12px" }}>→</div>
+        </div>
+      );
+    }
+
+    function SliderRow({ label, hint, accent, children }) {
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <span style={{ color: "#94a3b8", fontSize: "11.5px", minWidth: "100px" }}>{label}</span>
+          {children}
+          {hint && <span style={{ color: "#6b90b8", fontSize: "9.5px", whiteSpace: "nowrap" }}>{hint}</span>}
+        </div>
+      );
+    }
+
+    function PillBtn({ color, onClick, children }) {
+      return (
+        <button onClick={onClick} style={{
+          background: "transparent", border: `1px solid ${color}`, color,
+          padding: "5px 12px", borderRadius: "5px", cursor: "pointer",
+          fontFamily: "'Courier New', monospace", fontSize: "10.5px",
+        }}>
+          {children}
+        </button>
+      );
+    }
+
+    function OrientSwatch({ angle, label }) {
+      const [r, g, b] = orientColor(angle);
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "9.5px", color: "#6b90b8" }}>
+          <div style={{ width: 16, height: 3, borderRadius: 2, background: `rgb(${r},${g},${b})` }} />
+          {label}
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  MOUNT
+    // ═══════════════════════════════════════════════════════════════
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
